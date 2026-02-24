@@ -1,0 +1,538 @@
+Проект: /Users/ant/learn/s6-thread-c-sharp/ThreadPool
+Найдено файлов: 4
+============================================================
+
+AsyncLogger.cs
+----------------------------------------
+using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace ThreadPoolLab
+{
+    /// <summary>
+    /// Асинхронный логгер: записывает сообщения в файл
+    /// с использованием TAP и APM шаблонов.
+    /// </summary>
+    public static class AsyncLogger
+    {
+        private static readonly string LogFilePath = "processing.log";
+
+        // Объект синхронизации для предотвращения одновременной записи
+        private static readonly SemaphoreSlim WriteLock = new SemaphoreSlim(1, 1);
+
+        /// <summary>
+        /// TAP: асинхронно записывает сообщение в лог-файл.
+        /// Использует FileStream с флагом FileOptions.Asynchronous.
+        /// </summary>
+        public static async Task LogAsync(string message)
+        {
+            if (message == null) throw new ArgumentNullException(nameof(message));
+
+            string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}";
+            byte[] bytes = Encoding.UTF8.GetBytes(line);
+
+            // Захватываем семафор, чтобы не смешивать записи из разных потоков
+            await WriteLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                // FileOptions.Asynchronous включает истинно асинхронный I/O на уровне ОС
+                await using var fs = new FileStream(
+                    LogFilePath,
+                    FileMode.Append,
+                    FileAccess.Write,
+                    FileShare.Read,
+                    bufferSize: 4096,
+                    options: FileOptions.Asynchronous);
+
+                await fs.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
+            }
+            finally
+            {
+                WriteLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// APM: записывает сообщение в лог-файл с использованием
+        /// BeginWrite/EndWrite. Вызывает callback по завершении.
+        /// async/await не используется.
+        /// </summary>
+        public static void LogWithCallback(string message, Action? callback)
+        {
+            if (message == null) throw new ArgumentNullException(nameof(message));
+
+            string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}";
+            byte[] bytes = Encoding.UTF8.GetBytes(line);
+
+            // Открываем поток (будет закрыт в EndWrite-callback)
+            var fs = new FileStream(
+                LogFilePath,
+                FileMode.Append,
+                FileAccess.Write,
+                FileShare.Read,
+                bufferSize: 4096,
+                useAsync: true);   // useAsync=true эквивалентен FileOptions.Asynchronous
+
+            // Состояние, передаваемое через IAsyncResult.AsyncState
+            var state = (Stream: fs, Callback: callback);
+
+            fs.BeginWrite(bytes, 0, bytes.Length, ar =>
+            {
+                // Извлекаем состояние
+                var (stream, cb) = ((FileStream, Action?))ar.AsyncState!;
+                try
+                {
+                    stream.EndWrite(ar);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[AsyncLogger] Ошибка записи: {ex.Message}");
+                }
+                finally
+                {
+                    stream.Dispose();
+                    // Вызываем пользовательский callback
+                    cb?.Invoke();
+                }
+            }, state);
+        }
+    }
+}
+
+============================================================
+
+Program.cs
+----------------------------------------
+﻿using System;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using ThreadPoolLab;
+
+namespace ThreadPoolLab
+{
+    class Program
+    {
+        // Фиксированный seed для воспроизводимости
+        private const int RandomSeed = 345;
+        private const long DataSize = 20_000_000;
+
+        static async Task Main(string[] args)
+        {
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
+            Console.WriteLine("=== Система обработки финансовых данных ===");
+            Console.WriteLine($"Генерация {DataSize:N0} элементов...\n");
+
+            // ── Генерация данных ──────────────────────────────────────────────
+            decimal[] data = GenerateData(DataSize, RandomSeed);
+
+            await AsyncLogger.LogAsync($"Запуск обработки. Размер данных: {DataSize:N0}");
+
+            var processor = new TaskProcessor();
+
+            // ── Последовательная обработка (baseline) ────────────────────────
+            Console.WriteLine("Последовательная обработка...");
+            var sw = Stopwatch.StartNew();
+            decimal seqSum = SequentialSum(data);
+            sw.Stop();
+            long seqMs = sw.ElapsedMilliseconds;
+            await AsyncLogger.LogAsync($"Последовательная обработка: {seqMs} мс, сумма={seqSum}");
+            Console.WriteLine($"  Готово за {seqMs} мс\n");
+
+            // ── ThreadPool ────────────────────────────────────────────────────
+            Console.WriteLine("ThreadPool обработка...");
+            sw.Restart();
+            decimal[] tpParts = processor.ProcessDataWithThreadPool(data);
+            decimal tpSum = tpParts.Sum();
+            sw.Stop();
+            long tpMs = sw.ElapsedMilliseconds;
+            await AsyncLogger.LogAsync($"ThreadPool: {tpMs} мс, сумма={tpSum}");
+            Console.WriteLine($"  Готово за {tpMs} мс\n");
+
+            // ── TAP ───────────────────────────────────────────────────────────
+            Console.WriteLine("TAP обработка...");
+            sw.Restart();
+            decimal[] tapParts = await processor.ProcessDataAsync(data);
+            decimal tapSum = tapParts.Sum();
+            sw.Stop();
+            long tapMs = sw.ElapsedMilliseconds;
+            await AsyncLogger.LogAsync($"TAP: {tapMs} мс, сумма={tapSum}");
+            Console.WriteLine($"  Готово за {tapMs} мс\n");
+
+            // ── APM ───────────────────────────────────────────────────────────
+            Console.WriteLine("APM обработка...");
+
+            // Используем ManualResetEventSlim для ожидания APM-callback
+            using var apmDone = new ManualResetEventSlim(false);
+            decimal[] apmParts = [];
+            Exception? apmError = null;
+
+            sw.Restart();
+
+            // Логируем через APM-вариант логгера — демонстрируем LogWithCallback
+            AsyncLogger.LogWithCallback("APM обработка начата", null);
+
+            processor.BeginProcessData(data, ar =>
+            {
+                try
+                {
+                    apmParts = processor.EndProcessData(ar);
+                }
+                catch (Exception ex)
+                {
+                    apmError = ex;
+                }
+                finally
+                {
+                    apmDone.Set();
+                }
+            }, null);
+
+            // Ждём завершения APM операции (не блокируем пул потоков)
+            apmDone.Wait();
+            sw.Stop();
+            long apmMs = sw.ElapsedMilliseconds;
+
+            if (apmError != null)
+                throw apmError;
+
+            decimal apmSum = apmParts.Sum();
+            await AsyncLogger.LogAsync($"APM: {apmMs} мс, сумма={apmSum}");
+            Console.WriteLine($"  Готово за {apmMs} мс\n");
+
+            // ── Проверка корректности результатов ─────────────────────────────
+            const decimal tolerance = 0.0001m;
+            bool tpMatch = Math.Abs(seqSum - tpSum) < tolerance;
+            bool tapMatch = Math.Abs(seqSum - tapSum) < tolerance;
+            bool apmMatch = Math.Abs(seqSum - apmSum) < tolerance;
+            bool allMatch = tpMatch && tapMatch && apmMatch;
+
+            // ── Коэффициенты ускорения ────────────────────────────────────────
+            double tpSpeedup = seqMs > 0 ? (double)seqMs / tpMs : 0;
+            double tapSpeedup = seqMs > 0 ? (double)seqMs / tapMs : 0;
+            double apmSpeedup = seqMs > 0 ? (double)seqMs / apmMs : 0;
+
+            // ── Сводная статистика ────────────────────────────────────────────
+            Console.WriteLine(new string('═', 50));
+            Console.WriteLine("=== Результаты обработки ===");
+            Console.WriteLine($"Размер данных:           {DataSize:N0} элементов");
+            Console.WriteLine($"Последовательная:        {seqMs,8} мс");
+            Console.WriteLine($"ThreadPool обработка:    {tpMs,8} мс");
+            Console.WriteLine($"TAP обработка:           {tapMs,8} мс");
+            Console.WriteLine($"APM обработка:           {apmMs,8} мс");
+            Console.WriteLine($"Ускорение ThreadPool:    {tpSpeedup,8:F2}x");
+            Console.WriteLine($"Ускорение TAP:           {tapSpeedup,8:F2}x");
+            Console.WriteLine($"Ускорение APM:           {apmSpeedup,8:F2}x");
+            Console.WriteLine($"Результаты совпадают:    {(allMatch ? "Да" : "Нет")}");
+            Console.WriteLine(new string('═', 50));
+
+            await AsyncLogger.LogAsync(
+                $"Итог — Seq:{seqMs}мс TP:{tpMs}мс TAP:{tapMs}мс APM:{apmMs}мс " +
+                $"Совпадение:{(allMatch ? "Да" : "Нет")}");
+        }
+
+        /// <summary>
+        /// Генерирует массив случайных decimal-значений в диапазоне [1.0, 1000.0].
+        /// </summary>
+        private static decimal[] GenerateData(long size, int seed)
+        {
+            var rng = new Random(seed);
+            var result = new decimal[size];
+            for (int i = 0; i < size; i++)
+                result[i] = (decimal)(rng.NextDouble() * 999.0 + 1.0);
+            return result;
+        }
+
+        /// <summary>
+        /// Последовательная сумма массива — базовый алгоритм для сравнения.
+        /// </summary>
+        private static decimal SequentialSum(decimal[] data)
+        {
+            decimal sum = 0m;
+            for (int i = 0; i < data.Length; i++)
+                sum += data[i];
+            return sum;
+        }
+    }
+}
+
+============================================================
+
+TaskProcessor.cs
+----------------------------------------
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+
+namespace ThreadPoolLab
+{
+    /// <summary>
+    /// Обрабатывает массивы финансовых данных с использованием
+    /// ThreadPool, TAP и APM асинхронных шаблонов.
+    /// </summary>
+    public class TaskProcessor
+    {
+        // Количество частей, на которые делится массив
+        private const int PartCount = 8;
+
+        #region Вспомогательные методы
+
+        /// <summary>
+        /// Вычисляет сумму элементов в заданном диапазоне массива.
+        /// Используется всеми методами обработки.
+        /// </summary>
+        private static decimal SumRange(decimal[] data, int start, int length)
+        {
+            decimal sum = 0m;
+            int end = start + length;
+            for (int i = start; i < end; i++)
+                sum += data[i];
+            return sum;
+        }
+
+        /// <summary>
+        /// Разбивает массив на PartCount частей.
+        /// Возвращает массив пар (start, length) для каждой части.
+        /// </summary>
+        private static (int start, int length)[] SplitIntoParts(int totalLength)
+        {
+            var parts = new (int start, int length)[PartCount];
+            int baseSize = totalLength / PartCount;
+            int remainder = totalLength % PartCount;
+            int offset = 0;
+
+            for (int i = 0; i < PartCount; i++)
+            {
+                // Первые remainder частей получают на 1 элемент больше
+                int size = baseSize + (i < remainder ? 1 : 0);
+                parts[i] = (offset, size);
+                offset += size;
+            }
+
+            return parts;
+        }
+
+        #endregion
+
+        #region ThreadPool
+
+        /// <summary>
+        /// Обрабатывает данные с использованием ThreadPool.
+        /// Массив делится на 8 частей, каждая часть суммируется
+        /// в отдельном рабочем потоке из пула.
+        /// Возвращает массив частичных сумм по каждой части.
+        /// </summary>
+        public decimal[] ProcessDataWithThreadPool(decimal[] data)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+
+            var parts = SplitIntoParts(data.Length);
+            var partialSums = new decimal[PartCount];
+
+            // CountdownEvent: ждём завершения всех PartCount рабочих элементов
+            using var countdown = new CountdownEvent(PartCount);
+
+            // Храним исключения из рабочих потоков
+            Exception[] errors = new Exception[PartCount];
+
+            for (int i = 0; i < PartCount; i++)
+            {
+                // Захватываем переменные для замыкания
+                int partIndex = i;
+                (int start, int length) = parts[i];
+
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try
+                    {
+                        partialSums[partIndex] = SumRange(data, start, length);
+                    }
+                    catch (Exception ex)
+                    {
+                        errors[partIndex] = ex;
+                    }
+                    finally
+                    {
+                        // Сигнализируем о завершении независимо от результата
+                        countdown.Signal();
+                    }
+                });
+            }
+
+            // Блокируем текущий поток до завершения всех рабочих
+            countdown.Wait();
+
+            // Проверяем, были ли ошибки в рабочих потоках
+            foreach (var error in errors)
+            {
+                if (error != null)
+                    throw new AggregateException("Ошибка в рабочем потоке ThreadPool", error);
+            }
+
+            return partialSums;
+        }
+
+        #endregion
+
+        #region TAP (Task-based Asynchronous Pattern)
+
+        /// <summary>
+        /// Обрабатывает данные по шаблону TAP.
+        /// Каждая из 8 частей запускается через Task.Run,
+        /// затем результаты объединяются через Task.WhenAll.
+        /// </summary>
+        public Task<decimal[]> ProcessDataAsync(decimal[] data)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+
+            var parts = SplitIntoParts(data.Length);
+
+            // Создаём Task для каждой части
+            var tasks = new Task<decimal>[PartCount];
+            for (int i = 0; i < PartCount; i++)
+            {
+                (int start, int length) = parts[i];
+
+                // Task.Run отправляет работу в ThreadPool под управлением TPL
+                tasks[i] = Task.Run(() => SumRange(data, start, length));
+            }
+
+            // Когда все задачи завершены — собираем массив результатов
+            return Task.WhenAll(tasks);
+        }
+
+        #endregion
+
+        #region APM (Asynchronous Programming Model)
+
+        /// <summary>
+        /// Обрабатывает данные по шаблону APM.
+        /// Используются методы BeginProcessData / EndProcessData.
+        /// async/await не используется — чистый APM.
+        /// </summary>
+        public decimal[] ProcessDataWithAPM(decimal[] data)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+
+            IAsyncResult asyncResult = BeginProcessData(data, null, null);
+            return EndProcessData(asyncResult);
+        }
+
+        /// <summary>
+        /// Начинает асинхронную обработку данных (Begin-часть APM).
+        /// Запускает работу в ThreadPool и возвращает IAsyncResult.
+        /// </summary>
+        public IAsyncResult BeginProcessData(
+            decimal[] data,
+            AsyncCallback? callback,
+            object? state)
+        {
+            var tcs = new TaskCompletionSource<decimal[]>(state);
+
+            // Запускаем вычисления в ThreadPool через QueueUserWorkItem
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    var parts = SplitIntoParts(data.Length);
+                    var partialSums = new decimal[PartCount];
+
+                    using var countdown = new CountdownEvent(PartCount);
+                    Exception[] errors = new Exception[PartCount];
+
+                    for (int i = 0; i < PartCount; i++)
+                    {
+                        int partIndex = i;
+                        (int start, int length) = parts[i];
+
+                        ThreadPool.QueueUserWorkItem(__ =>
+                        {
+                            try
+                            {
+                                partialSums[partIndex] = SumRange(data, start, length);
+                            }
+                            catch (Exception ex)
+                            {
+                                errors[partIndex] = ex;
+                            }
+                            finally
+                            {
+                                countdown.Signal();
+                            }
+                        });
+                    }
+
+                    countdown.Wait();
+
+                    // Проверяем ошибки вложенных рабочих потоков
+                    Exception? firstError = null;
+                    foreach (var e in errors)
+                    {
+                        if (e != null) { firstError = e; break; }
+                    }
+
+                    if (firstError != null)
+                        tcs.SetException(firstError);
+                    else
+                        tcs.SetResult(partialSums);
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetException(ex);
+                }
+                finally
+                {
+                    // Вызываем callback, если он передан
+                    callback?.Invoke(tcs.Task);
+                }
+            });
+
+            return tcs.Task;
+        }
+
+        /// <summary>
+        /// Завершает асинхронную обработку данных (End-часть APM).
+        /// Блокирует вызывающий поток до получения результата.
+        /// </summary>
+        public decimal[] EndProcessData(IAsyncResult asyncResult)
+        {
+            if (asyncResult is not Task<decimal[]> task)
+                throw new ArgumentException("Некорректный IAsyncResult", nameof(asyncResult));
+
+            // Ожидаем завершения и возвращаем результат (блокирующий вызов)
+            try
+            {
+                return task.GetAwaiter().GetResult();
+            }
+            catch (AggregateException ae)
+            {
+                throw ae.InnerException ?? ae;
+            }
+        }
+
+        #endregion
+    }
+}
+
+============================================================
+
+ThreadPool.csproj
+----------------------------------------
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
+
+============================================================
+
